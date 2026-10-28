@@ -67,12 +67,16 @@ Display 2: Thunderbolt Display (main)
 
 ## Tested
 
-On a MacBook Pro (M4 Pro) with macOS 27.2:
+On a MacBook Pro (M4 Pro) with macOS 27.2 and an Apple Thunderbolt Display connected
+through a Dell WD22TB4 dock:
 
-- Apple Thunderbolt Display through a Dell WD22TB4 dock. The hidden 2048 × 1152 HiDPI mode
-  was selected through the same private calls. When the display set reconnected,
-  WindowServer applied the stored hidden mode again.
-- Built-in display: listing, selection and error handling with this tool.
+- The tool switched between hidden HiDPI modes (1920 × 1080 and 2048 × 1152), and macOS
+  stored the last one.
+- After the display was unplugged and connected again, WindowServer restored the hidden
+  2048 × 1152 HiDPI mode by itself.
+- After a remote-desktop session that turned the panel off and on again, the panel came
+  back in the same mode.
+- On the built-in display, listing, selection and error handling work as well.
 
 Reports from other Macs and displays are welcome.
 
