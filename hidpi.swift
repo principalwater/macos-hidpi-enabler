@@ -6,6 +6,10 @@
 // display-mode functions still list and select them. WindowServer stores a selection made
 // with kCGConfigurePermanently for the current set of displays and applies it again
 // whenever that set connects, so nothing keeps running afterwards.
+//
+// Intel Macs have no such hidden modes for most external displays: they build larger HiDPI
+// modes only from a list in the display's override file. `hidpi add` writes that list once,
+// and from then on WindowServer keeps those modes hidden in the same way.
 
 import AppKit
 import CoreGraphics
@@ -18,17 +22,22 @@ struct DisplayMode {
   let height: Int
   let scale: Float
   let refreshRate: Int
+  let depth: Int
   let isValid: Bool
+  let isNative: Bool
   let isHidden: Bool
 
   var isHiDPI: Bool { scale > 1 }
 
   var summary: String {
-    "\(width) x \(height) \(isHiDPI ? "HiDPI" : "LoDPI"), \(refreshRate) Hz"
+    // Intel Macs report a rate of 0 for some displays.
+    let rate = refreshRate > 0 ? ", \(refreshRate) Hz" : ""
+    return "\(width) x \(height) \(isHiDPI ? "HiDPI" : "LoDPI")\(rate)"
   }
 }
 
-/// The HiDPI modes of one size, one per refresh rate, in WindowServer order.
+/// The HiDPI modes of one size, in WindowServer order. WindowServer can list a mode once per
+/// color depth.
 struct HiDPISize {
   let width: Int
   let height: Int
@@ -36,13 +45,17 @@ struct HiDPISize {
 
   func line(current: Int32?) -> String {
     let size = "\(width) x \(height)"
-    let rates = modes.map { String($0.refreshRate) }.joined(separator: ", ")
+    var rates: [String] = []
+    for rate in modes.map(\.refreshRate) where rate > 0 && !rates.contains(String(rate)) {
+      rates.append(String(rate))
+    }
     var notes: [String] = []
     if modes.allSatisfy(\.isHidden) { notes.append("hidden") }
     if modes.contains(where: { $0.number == current }) { notes.append("current") }
     let padding = String(repeating: " ", count: max(1, 13 - size.count))
+    let rateColumn = rates.isEmpty ? "" : rates.joined(separator: ", ") + " Hz"
     let suffix = notes.isEmpty ? "" : "  " + notes.joined(separator: ", ")
-    return size + padding + rates + " Hz" + suffix
+    return size + padding + rateColumn + suffix
   }
 }
 
@@ -53,6 +66,13 @@ enum ToolError: Error, CustomStringConvertible {
   case noSuchMode(String, display: CGDirectDisplayID)
   case configurationFailed(CGError)
   case notApplied(DisplayMode)
+  case noNativeMode(CGDirectDisplayID)
+  case hasHiDPIModes(CGDirectDisplayID)
+  case needsRoot(String)
+  case overrideExists(String)
+  case overrideNotWritten(String)
+  case noOverride(String)
+  case foreignOverride(String)
 
   var description: String {
     switch self {
@@ -68,6 +88,23 @@ enum ToolError: Error, CustomStringConvertible {
       return "WindowServer rejected the display configuration (CGError \(error.rawValue))"
     case .notApplied(let mode):
       return "WindowServer did not switch to \(mode.summary)"
+    case .noNativeMode(let display):
+      return "display \(display) reports no native mode, so the sizes to add are unknown"
+    case .hasHiDPIModes(let display):
+      return "display \(display) already has HiDPI modes above half its size; "
+        + "run hidpi to list them"
+    case .needsRoot(let arguments):
+      return "changing /Library/Displays needs administrator rights; run: "
+        + "sudo \(CommandLine.arguments[0]) \(arguments)"
+    case .overrideExists(let path):
+      return "\(path) already exists; reconnect the display so macOS reads it, "
+        + "or move the file away to replace it"
+    case .overrideNotWritten(let path):
+      return "could not write \(path)"
+    case .noOverride(let path):
+      return "\(path) does not exist, so there is nothing to remove"
+    case .foreignOverride(let path):
+      return "\(path) was not written by hidpi, so it stays in place"
     }
   }
 }
@@ -95,6 +132,7 @@ struct PrivateDisplayModes {
 
   private static let descriptionLength = 0xD4
   private static let validFlag: UInt32 = 0x1
+  private static let nativeFlag: UInt32 = 0x0200_0000
 
   private let countModes: CountModes
   private let describeMode: DescribeMode
@@ -132,7 +170,9 @@ struct PrivateDisplayModes {
         height: height,
         scale: buffer.loadUnaligned(fromByteOffset: 0xD0, as: Float.self),
         refreshRate: Int(buffer.loadUnaligned(fromByteOffset: 0xBE, as: UInt16.self)),
+        depth: Int(buffer.loadUnaligned(fromByteOffset: 0x10, as: UInt32.self)),
         isValid: flags & Self.validFlag != 0,
+        isNative: flags & Self.nativeFlag != 0,
         isHidden: !publicNumbers.contains(number))
     }
   }
@@ -171,12 +211,97 @@ struct PrivateDisplayModes {
   }
 }
 
+/// The display override file that makes an Intel Mac generate larger HiDPI modes.
+///
+/// CoreDisplay uses the first file it finds for a display and looks in `folder` before the
+/// sealed system folder. Its built-in list of scaled modes stops at the panel size, so a
+/// HiDPI mode above half the panel size needs an entry here for its larger frame. An entry
+/// of scale-resolutions holds four big-endian UInt32 values: frame width, frame height,
+/// install flags and mode flags (IOFBInstallScaledModes in Apple's IOGraphicsLib.c).
+struct DisplayOverride {
+  private static let folder = "/Library/Displays/Contents/Resources/Overrides"
+  private static let systemFolder = "/System/Library/Displays/Contents/Resources/Overrides"
+  /// Marks a file as written by this tool, so `remove` never deletes someone else's.
+  private static let ownerKey = "macos-hidpi-enabler"
+  /// kScaleInstallAlways | kScaleInstallMirrorDeps
+  private static let installFlags: UInt32 = 0x9
+  /// kDisplayModeValidForMirroringFlag | kDisplayModeValidForHiResFlag
+  private static let modeFlags: UInt32 = 0x00A0_0000
+  /// The desktop sizes to offer, as fractions of the panel size. Half is left out: its frame
+  /// would match the panel's own mode, and macOS drops such an entry as a duplicate.
+  private static let fractions: [Double] = [1, 0.8, 0.75, 0.625, 0.5625]
+
+  let path: String
+  private let systemPath: String
+  private let vendor: UInt32
+  private let product: UInt32
+
+  init(display: CGDirectDisplayID) {
+    vendor = CGDisplayVendorNumber(display)
+    product = CGDisplayModelNumber(display)
+    let file =
+      "DisplayVendorID-\(String(vendor, radix: 16))/DisplayProductID-\(String(product, radix: 16))"
+    path = Self.folder + "/" + file
+    systemPath = Self.systemFolder + "/" + file
+  }
+
+  /// Writes the file, keeping what Apple's own file for this display says.
+  func install(native: DisplayMode, name: String) throws {
+    let files = FileManager.default
+    guard !files.fileExists(atPath: path) else { throw ToolError.overrideExists(path) }
+    var contents = NSDictionary(contentsOfFile: systemPath) as? [String: Any] ?? [:]
+    contents["DisplayVendorID"] = Int(vendor)
+    contents["DisplayProductID"] = Int(product)
+    contents["DisplayProductName"] = contents["DisplayProductName"] ?? name
+    contents["scale-resolutions"] = Self.scaleResolutions(native: native)
+    contents[Self.ownerKey] = true
+    let data = try PropertyListSerialization.data(
+      fromPropertyList: contents, format: .xml, options: 0)
+    try files.createDirectory(
+      atPath: (path as NSString).deletingLastPathComponent, withIntermediateDirectories: true,
+      attributes: [.posixPermissions: 0o755])
+    guard files.createFile(atPath: path, contents: data, attributes: [.posixPermissions: 0o644])
+    else { throw ToolError.overrideNotWritten(path) }
+  }
+
+  /// Deletes the file, if this tool wrote it.
+  func remove() throws {
+    guard let contents = NSDictionary(contentsOfFile: path) else {
+      throw ToolError.noOverride(path)
+    }
+    guard contents[Self.ownerKey] != nil else { throw ToolError.foreignOverride(path) }
+    try FileManager.default.removeItem(atPath: path)
+    // Fails harmlessly while the folder still holds a file for another display.
+    rmdir((path as NSString).deletingLastPathComponent)
+  }
+
+  private static func scaleResolutions(native: DisplayMode) -> [Data] {
+    fractions.map { fraction in
+      let width = (Double(native.width) * fraction).rounded()
+      let height = (width * Double(native.height) / Double(native.width)).rounded()
+      // A HiDPI mode renders a frame of twice its size.
+      let entry = [UInt32(width) * 2, UInt32(height) * 2, installFlags, modeFlags]
+      return entry.map(\.bigEndian).withUnsafeBytes { Data($0) }
+    }
+  }
+}
+
 func onlineDisplays() -> [CGDirectDisplayID] {
   var count: UInt32 = 0
   guard CGGetOnlineDisplayList(0, nil, &count) == .success, count > 0 else { return [] }
   var displays = [CGDirectDisplayID](repeating: 0, count: Int(count))
   guard CGGetOnlineDisplayList(count, &displays, &count) == .success else { return [] }
   return Array(displays.prefix(Int(count)))
+}
+
+/// Returns the online display that a command-line argument names.
+func onlineDisplay(_ argument: String) throws -> CGDirectDisplayID {
+  let display: CGDirectDisplayID? =
+    argument == "main" ? CGMainDisplayID() : CGDirectDisplayID(argument)
+  guard let display, onlineDisplays().contains(display) else {
+    throw ToolError.unknownDisplay(argument)
+  }
+  return display
 }
 
 @MainActor
@@ -189,7 +314,7 @@ func displayName(_ display: CGDirectDisplayID) -> String {
   return CGDisplayIsBuiltin(display) != 0 ? "Built-in display" : "Display"
 }
 
-/// Groups the valid HiDPI modes by size, keeping one mode per refresh rate.
+/// Groups the valid HiDPI modes by size.
 func hiDPISizes(_ modes: [DisplayMode]) -> [HiDPISize] {
   var sizes: [HiDPISize] = []
   for mode in modes where mode.isValid && mode.isHiDPI {
@@ -199,11 +324,14 @@ func hiDPISizes(_ modes: [DisplayMode]) -> [HiDPISize] {
       sizes.append(HiDPISize(width: mode.width, height: mode.height, modes: [mode]))
       continue
     }
-    if !sizes[index].modes.contains(where: { $0.refreshRate == mode.refreshRate }) {
-      sizes[index].modes.append(mode)
-    }
+    sizes[index].modes.append(mode)
   }
   return sizes
+}
+
+/// Whether a HiDPI size lies above half the panel size, the range that `hidpi add` adds.
+func hasLargeHiDPISize(_ sizes: [HiDPISize], native: DisplayMode) -> Bool {
+  sizes.contains { $0.width > native.width / 2 }
 }
 
 @MainActor
@@ -221,17 +349,20 @@ func listDisplays(using api: PrivateDisplayModes) {
     for size in sizes {
       print("    " + size.line(current: current))
     }
+    if let native = modes.first(where: \.isNative), !hasLargeHiDPISize(sizes, native: native) {
+      let isWritten = FileManager.default.fileExists(atPath: DisplayOverride(display: display).path)
+      print(
+        isWritten
+          ? "  reconnect the display or restart so macOS reads its override file"
+          : "  add larger sizes with: sudo hidpi add \(display)")
+    }
   }
   print("\nSelect one with: hidpi DISPLAY WIDTHxHEIGHT[@HZ]")
 }
 
 @MainActor
 func selectMode(using api: PrivateDisplayModes, display argument: String, size: String) throws {
-  let display: CGDirectDisplayID? =
-    argument == "main" ? CGMainDisplayID() : CGDirectDisplayID(argument)
-  guard let display, onlineDisplays().contains(display) else {
-    throw ToolError.unknownDisplay(argument)
-  }
+  let display = try onlineDisplay(argument)
   let parts = size.split(separator: "@", maxSplits: 1)
   let dimensions = parts.first?.split(separator: "x").compactMap { Int($0) } ?? []
   let refreshRate = parts.count == 2 ? Int(parts[1]) : nil
@@ -242,21 +373,51 @@ func selectMode(using api: PrivateDisplayModes, display argument: String, size: 
     hiDPISizes(api.modes(of: display)).first {
       $0.width == dimensions[0] && $0.height == dimensions[1]
     }?.modes ?? []
-  // Without an explicit rate, take the fastest one, as System Settings does by default.
-  let mode =
-    refreshRate == nil
-    ? candidates.max { $0.refreshRate < $1.refreshRate }
-    : candidates.first { $0.refreshRate == refreshRate }
+  // Without an explicit rate, take the fastest one, as System Settings does by default. Of its
+  // color depths, take the deepest, so that switching does not lower the depth.
+  let matching =
+    refreshRate == nil ? candidates : candidates.filter { $0.refreshRate == refreshRate }
+  let mode = matching.max { ($0.refreshRate, $0.depth) < ($1.refreshRate, $1.depth) }
   guard let mode else { throw ToolError.noSuchMode(size, display: display) }
   try api.select(mode, on: display)
   print("\(displayName(display)): \(mode.summary) selected.")
   print("macOS keeps it for this set of displays and applies it again on every connect.")
 }
 
+@MainActor
+func addModes(using api: PrivateDisplayModes, display argument: String) throws {
+  let display = try onlineDisplay(argument)
+  let modes = api.modes(of: display)
+  guard let native = modes.first(where: \.isNative) else {
+    throw ToolError.noNativeMode(display)
+  }
+  guard !hasLargeHiDPISize(hiDPISizes(modes), native: native) else {
+    throw ToolError.hasHiDPIModes(display)
+  }
+  guard geteuid() == 0 else { throw ToolError.needsRoot("add \(display)") }
+  let override = DisplayOverride(display: display)
+  try override.install(native: native, name: displayName(display))
+  print("\(displayName(display)): wrote \(override.path).")
+  print("Reconnect the display or restart so macOS reads it, then run hidpi to list the new modes.")
+}
+
+@MainActor
+func removeModes(display argument: String) throws {
+  let display = try onlineDisplay(argument)
+  guard geteuid() == 0 else { throw ToolError.needsRoot("remove \(display)") }
+  let override = DisplayOverride(display: display)
+  try override.remove()
+  print("\(displayName(display)): removed \(override.path).")
+  print("Reconnect the display or restart so macOS stops offering the added modes.")
+}
+
 let usage = """
-  usage: hidpi                          list displays and their HiDPI modes
+  usage: hidpi                            list displays and their HiDPI modes
          hidpi DISPLAY WIDTHxHEIGHT[@HZ]  switch DISPLAY (an ID from the list, or main)
                                           to that HiDPI mode and keep it
+         sudo hidpi add DISPLAY           make an Intel Mac generate larger HiDPI modes
+                                          for DISPLAY, with a display override file
+         sudo hidpi remove DISPLAY        delete that file
   """
 
 /// Runs the command line and returns the process exit status.
@@ -272,10 +433,11 @@ func run(_ arguments: [String]) -> Int32 {
   }
   do {
     let api = try PrivateDisplayModes()
-    if arguments.isEmpty {
-      listDisplays(using: api)
-    } else {
-      try selectMode(using: api, display: arguments[0], size: arguments[1])
+    switch arguments.first {
+    case nil: listDisplays(using: api)
+    case "add": try addModes(using: api, display: arguments[1])
+    case "remove": try removeModes(display: arguments[1])
+    default: try selectMode(using: api, display: arguments[0], size: arguments[1])
     }
     return 0
   } catch {

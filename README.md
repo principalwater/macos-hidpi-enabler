@@ -1,7 +1,8 @@
 # macos-hidpi-enabler
 
 Switch a Mac display to HiDPI resolutions that macOS already generates but hides.
-One command, nothing left running.
+One command, nothing left running. On Intel Macs, which do not generate them, one more
+command adds them.
 
 ## Why
 
@@ -20,8 +21,22 @@ HiDPI only up to 1280 × 720, while WindowServer keeps hidden HiDPI modes up to
 functions, marks the modes that public APIs hide, and switches to the one you choose with
 `kCGConfigurePermanently`. WindowServer stores that choice for the current set of
 displays and applies it again whenever the same set connects. There is no daemon, login
-item, menu bar icon, kernel extension or display override file, and no admin rights are
-needed.
+item, menu bar icon or kernel extension. On a Mac that has hidden modes for the display
+there is no display override file either, and no admin rights are needed.
+
+### Intel Macs
+
+An Intel Mac usually has nothing to reveal. macOS builds scaled modes from a built-in list
+that stops at the panel size, and it builds larger ones only from the `scale-resolutions`
+list in a display's override file. Most external displays have no such list, so `hidpi`
+reports no HiDPI modes above half the panel size.
+
+`sudo hidpi add DISPLAY` writes the list once, for sizes above half of the panel up to its
+full size, to
+`/Library/Displays/Contents/Resources/Overrides/DisplayVendorID-*/DisplayProductID-*`. It
+never replaces an existing file. After the display reconnects, macOS generates those modes
+and hides them as described above, so list and select them with `hidpi`, without admin
+rights and with nothing left running. `sudo hidpi remove DISPLAY` deletes the file again.
 
 ## Usage
 
@@ -32,6 +47,15 @@ git clone https://github.com/principalwater/macos-hidpi-enabler
 cd macos-hidpi-enabler
 swift hidpi.swift               # list displays and their HiDPI modes
 swift hidpi.swift 2 2048x1152   # switch display 2 to 2048 × 1152 HiDPI and keep it
+```
+
+On an Intel Mac, build the binary and add the modes first. Then reconnect the display or
+restart so that macOS reads the new file, and list them:
+
+```sh
+swiftc -O hidpi.swift -o hidpi
+sudo ./hidpi add 2              # make macOS generate larger HiDPI modes for display 2
+./hidpi                         # after reconnecting the display: list them
 ```
 
 To keep a binary instead, build it once with `swiftc -O hidpi.swift -o hidpi`.
@@ -57,7 +81,8 @@ Display 2: Thunderbolt Display (main)
 - Only modes that WindowServer generates can be selected. On M4 and M5 Macs the display
   engine limits a single-stream display to a 6720-pixel-wide frame, so a 4K display gets
   no 3840 × 2160 HiDPI mode ([details](https://smcleod.net/2026/03/new-apple-silicon-m4-m5-hidpi-limitation-on-4k-external-displays/)).
-  Sizes that are missing from the list need an app that creates a virtual display.
+  Sizes that are missing from the list need an app that creates a virtual display, or
+  `hidpi add` on an Intel Mac.
 - macOS stores one setting per set of connected displays. Run the command in each
   arrangement where you want the mode, for example with the laptop lid open and closed.
 - Choosing a resolution in System Settings replaces the stored mode; run the command again
@@ -77,6 +102,17 @@ through a Dell WD22TB4 dock:
 - After a remote-desktop session that turned the panel off and on again, the panel came
   back in the same mode.
 - On the built-in display, listing, selection and error handling work as well.
+
+On a Mac Pro 6,1 (AMD FirePro D700) with macOS 15.7.9 through OpenCore Legacy Patcher and
+an Apple Thunderbolt Display:
+
+- macOS listed no HiDPI modes for the display at first.
+- After `sudo hidpi add` and reconnecting the display, it listed hidden HiDPI modes from
+  1440 × 810 to 2560 × 1440. Asking WindowServer to detect displays was not enough.
+- The tool switched to 2048 × 1152 HiDPI with a 4096 × 2304 frame, and the color depth stayed
+  at 30 bits. macOS stored the mode.
+- Whether the mode returns after a reconnect, sleep or restart has not been tested on this
+  Mac. `hidpi remove` has been tested only on a scratch folder, not with a live display.
 
 Reports from other Macs and displays are welcome.
 
